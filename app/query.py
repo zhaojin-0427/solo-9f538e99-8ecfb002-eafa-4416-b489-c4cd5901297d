@@ -2,10 +2,10 @@
 
 快照语义
 ========
-* 首次查询（不带 ``snapshot_id``）把*当前字段名集合*与*当前全部分片*
-  写入 ``snapshots`` / ``snapshot_fields`` / ``snapshot_shards``。
-* 之后的分页、字段改名/删除/新增、新上传乃至进程重启，都不会改变该快照
-  看到的字段与分片；读取完全以快照表为准。
+* 首次查询（不带 ``snapshot_id``）把*当前字段名集合*与*当前全部在供分片*
+  （已隔离分片除外）写入 ``snapshots`` / ``snapshot_fields`` / ``snapshot_shards``。
+* 之后的分页、字段改名/删除/新增、新上传、分片隔离乃至进程重启，都不会
+  改变该快照看到的字段与分片；读取完全以快照表为准。
 * 合读按指标身份列对齐：新增指标在旧分片为 NULL；同名复用得到新身份，
   旧分片没有该身份列，同样为 NULL，不会继承旧指标的值。
 """
@@ -22,7 +22,11 @@ from .models import ConflictError, NotFound
 
 
 def create_snapshot(conn: sqlite3.Connection) -> dict:
-    """在调用方写事务内创建快照，固化当前字段与当前全部分片。"""
+    """在调用方写事务内创建快照，固化当前字段与当前全部在供分片。
+
+    已隔离（停供）的分片不进入新快照；此前创建的旧快照不受影响，
+    仍按其固化的分片清单读取原文件。
+    """
     cur = conn.execute("INSERT INTO snapshots DEFAULT VALUES")
     snapshot_id = int(cur.lastrowid)
 
@@ -36,7 +40,11 @@ def create_snapshot(conn: sqlite3.Connection) -> dict:
             (snapshot_id, row["indicator_id"], row["name"], position),
         )
 
-    shards = conn.execute("SELECT shard_id FROM shards ORDER BY shard_id").fetchall()
+    shards = conn.execute(
+        "SELECT shard_id FROM shards "
+        "WHERE shard_id NOT IN (SELECT shard_id FROM isolated_shards) "
+        "ORDER BY shard_id"
+    ).fetchall()
     for position, row in enumerate(shards):
         conn.execute(
             "INSERT INTO snapshot_shards (snapshot_id, shard_id, position) VALUES (?, ?, ?)",

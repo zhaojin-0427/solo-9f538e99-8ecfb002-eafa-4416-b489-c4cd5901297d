@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS snapshot_shards (
     PRIMARY KEY (snapshot_id, shard_id)
 );
 
+-- 质控隔离事件：一次成功隔离的审计记录（detail 为请求与结果的 JSON）
+CREATE TABLE IF NOT EXISTS isolation_events (
+    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    key_count   INTEGER NOT NULL,
+    detail      TEXT NOT NULL
+);
+
+-- 被隔离（停供）的分片：只打标记、不删文件。
+-- 之后新建的快照排除这些分片；旧快照固化的分片清单不变，仍可分页读取原文件。
+CREATE TABLE IF NOT EXISTS isolated_shards (
+    shard_id     INTEGER PRIMARY KEY REFERENCES shards(shard_id),
+    event_id     INTEGER NOT NULL REFERENCES isolation_events(event_id),
+    isolated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_indicators_active ON indicators(active);
 CREATE INDEX IF NOT EXISTS idx_version_indicators_version
     ON version_indicators(version_id);

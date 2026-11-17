@@ -96,6 +96,43 @@ def main() -> int:
     assert rejected.status_code == 409, rejected.text
     print("deleted-indicator upload rejected:", rejected.json()["detail"])
 
+    # ------------------------------------------------------------------
+    # 质控隔离：同一质控样在两个分片读数矛盾 -> 隔离最少来源
+    # ------------------------------------------------------------------
+    qc_indicator = c.get("/schema").json()["indicators"][0]["indicator_id"]
+    cur_version = c.get("/schema").json()["current_version"]
+    # 先恢复一个存续指标用于质控（硝酸盐仍存续）
+    for name, val in [("qc-a.parquet", 10.0), ("qc-b.parquet", 10.4), ("qc-c.parquet", 99.0)]:
+        r = c.post(
+            "/ingest/parquet",
+            data={"schema_version": str(cur_version)},
+            files={"file": (name, parquet_bytes({
+                "station": ["QC"], "sampled_at": ["2026-02-01T00:00:00Z"], "硝酸盐": [val],
+            }, {"sampled_at": pa.string()}), "application/vnd.apache.parquet")},
+        )
+        assert r.status_code == 200, r.text
+
+    old_snap = c.get("/rows").json()["snapshot_id"]
+    r = c.post("/qc/isolate", json={"keys": [{
+        "station": "QC", "sampled_at": "2026-02-01T00:00:00Z",
+        "indicator_id": qc_indicator, "tolerance": 0.5,
+    }]})
+    assert r.status_code == 200, r.text
+    qc = r.json()
+    print("qc isolate:", qc["isolated_shard_ids"], qc["message"])
+    assert len(qc["isolated_shard_ids"]) == 1  # 离群的 99.0 或升序最小者，恰隔离 1 个
+    spread = qc["key_results"][0]["spread"]
+    assert spread > 0.5
+
+    # 新快照排除已隔离分片；旧快照仍读原文件
+    new_page = c.get("/rows").json()
+    old_page = c.get("/rows", params={"snapshot_id": old_snap, "page_size": 10000}).json()
+    assert new_page["total_rows"] == old_page["total_rows"] - 1
+    iso = c.get("/qc/isolations").json()
+    assert iso["isolated_shard_ids"] == qc["isolated_shard_ids"]
+    print("isolations:", iso["isolated_shard_ids"],
+          "old rows:", old_page["total_rows"], "new rows:", new_page["total_rows"])
+
     print("\nSMOKE OK")
     return 0
 

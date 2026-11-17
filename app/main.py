@@ -1,28 +1,34 @@
-"""FastAPI 入口：化验表字段管理、Parquet 上传与快照分页查询。
+"""FastAPI 入口：化验表字段管理、Parquet 上传、快照分页查询与质控隔离。
 
 并发模型
 ========
 进程内一把可重入锁 ``write_lock`` 保护所有变更（字段改名/删除/新增、上传、
-快照创建）。锁内再以 ``BEGIN IMMEDIATE`` 事务裁决，保证字段变更与上传交错时
-依据同一个已提交字段状态；任何失败都回滚，不开放半份结果。
+快照创建、质控隔离）。锁内再以 ``BEGIN IMMEDIATE`` 事务裁决，保证这些操作
+交错时依据同一个已提交状态；任何失败都回滚，不开放半份结果。
 """
 from __future__ import annotations
 
+import json
+import math
 import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import catalog, ingest, query
+from . import catalog, ingest, qc, query
 from .config import FIXED_COLUMNS, MAX_INDICATORS
 from .db import connect, immediate_transaction, init_db
 from .models import (
     CreateIndicatorRequest,
     IndicatorChangeResponse,
     IndicatorOut,
+    IsolationListOut,
     NotFound,
+    QcIsolateRequest,
+    QcIsolateResponse,
     RenameRequest,
     RowPage,
     SchemaOut,
@@ -45,7 +51,8 @@ app = FastAPI(
         "固定站点 + UTC 采样时刻，至多 8 个可空浮点指标的化验表服务。\n\n"
         "- 指标有稳定身份，改名不换身份；同名复用是全新指标，不继承旧值。\n"
         "- 上传 Parquet 必须指定字段版；含已删指标或未知列整次拒绝。\n"
-        "- 首次查询固化字段与分片并返回快照号，之后任何变更/上传/重启都不影响该快照。"
+        "- 首次查询固化字段与分片并返回快照号，之后任何变更/上传/重启都不影响该快照。\n"
+        "- 质控隔离按质控键找出最少应停供的来源分片；新快照排除已隔离分片，旧快照仍读原文件。"
     ),
     lifespan=lifespan,
 )
@@ -66,6 +73,30 @@ def get_conn():
 @app.exception_handler(NotFound)
 async def not_found_handler(_request: Request, exc: NotFound):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+def _json_safe(value):
+    """无害化校验错误内容，保证 422 响应可序列化为标准 JSON。
+
+    - NaN/Inf 浮点不是标准 JSON，替换为字符串；
+    - pydantic 错误 ctx 中携带的异常对象替换为其字符串形式。
+    """
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return repr(value)
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(_request: Request, exc: RequestValidationError):
+    # 默认处理器在遇到 NaN 输入或 ctx 中的异常对象时自身会序列化失败；这里先做无害化
+    safe = json.loads(json.dumps(_json_safe(exc.errors()), default=str))
+    return JSONResponse(status_code=422, content={"detail": safe})
 
 
 @app.get("/health", tags=["运维"], summary="健康检查")
@@ -246,3 +277,50 @@ def root():
         "max_indicators": MAX_INDICATORS,
         "fixed_columns": list(FIXED_COLUMNS),
     }
+
+
+# ---------------------------------------------------------------------------
+# 质控隔离
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/qc/isolate",
+    response_model=QcIsolateResponse,
+    tags=["质控"],
+    summary="质控隔离：按质控键找出最少应停供的来源分片",
+    description=(
+        "接收 1~20 个质控键（站点 + UTC 时刻 + 存续指标 ID + 非负绝对容差），"
+        "从在供分片读取同键非 NULL 值，求隔离分片数最少的方案："
+        "每个键在剩余分片中至少保留一条读数且极差不超过容差；"
+        "数量相同时取分片 ID 升序序列最小者。"
+        "相关分片超过 12 个、存在缺测键或无可行方案时整次拒绝，供数不变。"
+    ),
+)
+def qc_isolate(
+    payload: QcIsolateRequest,
+    request: Request,
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    keys = [
+        qc.QcKey(
+            station=k.station,
+            sampled_at=qc.parse_utc_instant(k.sampled_at),
+            indicator_id=k.indicator_id,
+            tolerance=k.tolerance,
+        )
+        for k in payload.keys
+    ]
+    # 与上传、建快照共用同一把写锁 + 立即事务：交错时彼此只见完整结果
+    with lock, immediate_transaction(conn):
+        return qc.isolate(conn, keys)
+
+
+@app.get(
+    "/qc/isolations",
+    response_model=IsolationListOut,
+    tags=["质控"],
+    summary="查看当前已隔离（停供）的分片",
+)
+def qc_isolations(conn=Depends(get_conn)):
+    return qc.list_isolations(conn)
